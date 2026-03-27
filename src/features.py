@@ -140,30 +140,54 @@ def add_overnight_features(
 ) -> pd.DataFrame:
     """添加隔夜因子特征（海外市场、商品、汇率等）。
 
-    关键时间线（北京时间）：
-    - 港股现货收盘 16:00 → A股次日开盘前可用
-    - 港股期货夜盘收盘 01:00 次日 → A股次日开盘前可用（包含美股开盘后信息）
-    - 新加坡A50期货夜盘收盘 04:45 次日 → A股次日开盘前可用（最接近A股开盘的参考）
-    - 美股收盘 ~04:00 次日 → A股次日开盘前可用
-    - 美股中国ETF（ASHR/FXI/KWEB/MCHI）→ 反映海外资金对A股的隔夜定价
+    ===== 时间对齐原则 =====
+    预测目标: A股 T日 9:30 的开盘跳空
+    可用信息: 严格限于 T日 9:30 之前已确定的数据
+
+    各数据源时间线（北京时间）:
+
+    【可直接使用 T-1 日数据的境内数据源（需 shift+1）】
+    - 上海金基准价:    T日白天交易时段产生 → 只能用 T-1日数据
+    - SHIBOR隔夜利率:  T日 11:30 发布     → 只能用 T-1日数据
+    - USD/CNY汇率:     央行中间价 T日 9:15 发布，但中行汇买价更新时间不确定
+                       → 保守处理，只用 T-1日数据
+
+    【境外数据源（日历日 d 的数据 → shift+1 对齐到 A股 d+1 日）】
+    - 美股三大指数:     收盘于北京时间 d+1 凌晨 04:00 → A股 d+1 开盘前可用 ✓
+    - 美股中国ETF:      同美股时段 → shift+1 ✓
+    - VIX:             同美股时段 → shift+1 ✓
+    - 美债收益率:       美国时间日终 → shift+1 ✓
+    - 境外商品期货:     主力合约以美国时间结算 → shift+1 ✓
+
+    【港股/A50 注意事项】
+    - 港股期货: akshare 日线只含日盘(9:30-16:00)收盘价，不含夜盘(17:15-03:00)
+      → 日盘 T日 16:00 收盘 → shift+1 对齐到 A股 T+1 日 ✓
+      → 夜盘(T日 17:15 ~ T+1日 03:00)数据缺失，这部分信息体现在美股/VIX中
+    - A50期货: akshare 日线只含 T session(9:00-16:30)结算价
+      → shift+1 ✓
+      → T+1 session(17:00-04:45次日)数据缺失，同样体现在美股走势中
     """
     df = df.copy()
 
-    # === 美股指数（T日收盘 → A股T+1日） ===
+    # ============================================================
+    # 境外数据源：日历日 d 的数据 shift+1 对齐到 A股 d+1 日
+    # ============================================================
+
+    # === 美股指数（美股日历日 d 收盘 = 北京时间 d+1 凌晨 ~04:00） ===
     for odf in overseas_dfs:
         df = _merge_overnight_df(df, odf, shift_days=1)
 
-    # === 美股中国相关ETF（T日收盘 → A股T+1日，反映海外资金对A股/中概股隔夜定价） ===
+    # === 美股中国相关ETF（同美股时段，shift+1） ===
     if china_etf_dfs:
         for odf in china_etf_dfs:
             df = _merge_overnight_df(df, odf, shift_days=1)
 
-    # === 港股期货（T日夜盘收盘 → A股T+1日，夜盘包含了美股开盘后的信息） ===
+    # === 港股（日盘 T日 16:00 收盘 → 对齐 A股 T+1 日） ===
     if hk_dfs:
         for odf in hk_dfs:
             df = _merge_overnight_df(df, odf, shift_days=1)
 
-    # === 富时A50期货（最直接的A股隔夜参考） ===
+    # === 富时A50期货（T session 16:30 结算 → 对齐 A股 T+1 日） ===
     if a50_df is not None and not a50_df.empty:
         a50 = a50_df.copy()
         a50["a50_ret"] = a50["a50_close"].pct_change() * 100
@@ -175,16 +199,16 @@ def add_overnight_features(
             direction="backward",
         )
 
-    # === 大宗商品期货（原油、铜等） ===
+    # === 境外商品期货（以美国时间结算，shift+1） ===
     if commodity_dfs:
         for odf in commodity_dfs:
             df = _merge_overnight_df(df, odf, shift_days=1)
 
-    # === VIX 恐慌指数 ===
+    # === VIX 恐慌指数（美股时段，shift+1） ===
     if vix_df is not None and not vix_df.empty:
         vix = vix_df.copy()
         vix["vix_ret"] = vix["vix_close"].pct_change() * 100
-        vix["vix_level"] = vix["vix_close"]  # VIX绝对水平也有意义
+        vix["vix_level"] = vix["vix_close"]
         vix["date"] = vix["date"] + pd.Timedelta(days=1)
         df = pd.merge_asof(
             df.sort_values("date"),
@@ -193,7 +217,7 @@ def add_overnight_features(
             direction="backward",
         )
 
-    # === 美债收益率 ===
+    # === 美债收益率（美国时间日终，shift+1） ===
     if us_treasury_df is not None and not us_treasury_df.empty:
         tsy = us_treasury_df.copy()
         if "us10y_yield" in tsy.columns:
@@ -208,10 +232,16 @@ def add_overnight_features(
             direction="backward",
         )
 
-    # === 黄金 ===
+    # ============================================================
+    # 境内数据源：T日数据在 A股 T日 9:30 开盘后才产生
+    # 必须 shift+1，只使用 T-1 日数据
+    # ============================================================
+
+    # === 黄金（上海金基准价，T日交易时段产生 → 只能用 T-1 日） ===
     if gold_df is not None and not gold_df.empty:
         gold = gold_df.copy()
         gold["gold_ret"] = gold["gold_price"].pct_change() * 100
+        gold["date"] = gold["date"] + pd.Timedelta(days=1)  # shift+1 避免泄露
         df = pd.merge_asof(
             df.sort_values("date"),
             gold.sort_values("date"),
@@ -219,10 +249,11 @@ def add_overnight_features(
             direction="backward",
         )
 
-    # === 汇率 ===
+    # === 汇率（中行汇买价，T日营业时间更新 → 保守处理用 T-1 日） ===
     if usd_cny_df is not None and not usd_cny_df.empty:
         fx = usd_cny_df.copy()
         fx["usd_cny_ret"] = fx["usd_cny"].pct_change() * 100
+        fx["date"] = fx["date"] + pd.Timedelta(days=1)  # shift+1 避免泄露
         df = pd.merge_asof(
             df.sort_values("date"),
             fx.sort_values("date"),
@@ -230,11 +261,13 @@ def add_overnight_features(
             direction="backward",
         )
 
-    # === SHIBOR ===
+    # === SHIBOR（T日 11:30 发布 → 只能用 T-1 日） ===
     if shibor_df is not None and not shibor_df.empty:
+        shibor = shibor_df.copy()
+        shibor["date"] = shibor["date"] + pd.Timedelta(days=1)  # shift+1 避免泄露
         df = pd.merge_asof(
             df.sort_values("date"),
-            shibor_df.sort_values("date"),
+            shibor.sort_values("date"),
             on="date",
             direction="backward",
         )
@@ -275,20 +308,28 @@ def build_features(
         china_etf_dfs=china_etf_dfs,
     )
 
-    # 5. 所有特征向后移一期（确保使用前一日信息预测当日开盘跳空）
-    target_col = "gap_pct"
-    date_col = "date"
-    non_feature_cols = [date_col, target_col, "open", "close", "high", "low",
-                        "volume", "amount", "prev_close", "turnover",
-                        "pct_change", "change"]
-    feature_cols = [c for c in df.columns if c not in non_feature_cols]
+    # ============================================================
+    # 5. 时间对齐 shift 处理
+    # ============================================================
+    #
+    # 预测目标: A股 T日 9:30 开盘跳空
+    # 可用信息: T日 9:30 之前已确定的数据
+    #
+    # 【A股自身技术指标】
+    # 这些指标使用了 T日 的 OHLCV 计算（如 close, volume, turnover），
+    # 而 T日 的 OHLCV 在 T日 15:00 收盘后才确定。
+    # 因此必须 shift(1)，将 T-1 日的指标值用于 T日 的预测。
+    #
+    # 【隔夜因子】
+    # 已在 add_overnight_features() 中通过日期 +1 天处理，无需额外 shift。
+    # - 境外数据(美股/港股/A50/商品/VIX/美债): date += 1 day
+    # - 境内数据(黄金/汇率/SHIBOR): date += 1 day
+    #
+    # 【日历特征】
+    # weekday/month/quarter/is_month_start/is_month_end: T日的日历属性
+    # 在 T日 开盘前就已知，无需 shift。
+    # days_since_prev/is_after_holiday: 基于交易日间隔，T日开盘前已知，无需 shift。
 
-    # 对于技术指标，它们已经基于当日收盘价计算，需要shift(1)确保不泄露
-    # 但隔夜因子（overseas已经+1天对齐）不需要额外shift
-    # 统一处理：所有自行计算的技术指标和日历特征用当日值（它们基于历史数据计算）
-    # 隔夜因子已通过日期偏移处理
-
-    # shift 技术指标和日历特征（这些使用了当日收盘价信息）
     tech_cols = [c for c in df.columns if any(c.startswith(p) for p in [
         "ret_", "volatility_", "ma_bias_", "vol_ratio_", "amt_ratio_",
         "amplitude", "upper_shadow", "lower_shadow", "intraday_ret",
