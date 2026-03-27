@@ -44,6 +44,13 @@ COMMODITY_FUTURES = {
     "COMEX铜": "HG",
 }
 
+# 欧洲指数（收盘于北京时间次日 ~00:30-01:00，A股开盘前可用）
+EURO_INDICES = {
+    "欧洲斯托克50": "STOXX50",  # Euro Stoxx 50
+    "德国DAX": "DAX",
+    "英国富时100": "FTSE",
+}
+
 # VIX 恐慌指数
 VIX_SYMBOL = "VIX"
 
@@ -255,6 +262,56 @@ def fetch_us_treasury_yield() -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def fetch_offshore_cnh() -> pd.DataFrame:
+    """获取离岸人民币 (USD/CNH) 汇率数据。
+
+    离岸人民币24小时交易，能反映A股休市期间的市场情绪变化。
+    与在岸 USD/CNY 不同，CNH 不受央行直接管控，更市场化。
+    夜间的 CNH 走势是A股次日开盘的重要参考。
+    """
+    print("  获取离岸人民币 (USD/CNH) 数据 ...")
+    try:
+        df = ak.currency_boc_safe(
+            symbol="美元",
+            start_date="20180101",
+            end_date=pd.Timestamp.now().strftime("%Y%m%d"),
+        )
+        # 中行卖出价更接近离岸市场报价
+        df = df.rename(columns={"日期": "date", "中行钞卖价": "usd_cnh"})
+        df["date"] = pd.to_datetime(df["date"])
+        df["usd_cnh"] = pd.to_numeric(df["usd_cnh"], errors="coerce")
+        df = df[["date", "usd_cnh"]].dropna().sort_values("date").reset_index(drop=True)
+        return df
+    except Exception as e:
+        print(f"  [警告] 获取离岸人民币数据失败: {e}")
+        return pd.DataFrame()
+
+
+def fetch_euro_index(symbol: str, name: str) -> pd.DataFrame:
+    """获取欧洲主要指数日线数据。
+
+    欧洲市场交易时间：北京时间 15:00/16:00 - 23:30/00:30+1
+    收盘时间早于美股，但晚于A股，可作为A股次日的隔夜参考。
+    """
+    print(f"  获取 {name} ({symbol}) 数据 ...")
+    try:
+        # akshare 部分欧洲指数可通过外盘期货接口获取
+        df = ak.futures_foreign_hist(symbol=symbol)
+        df = df.rename(columns={
+            "date": "date", "日期": "date",
+            "收盘价": f"eu_{symbol}_close", "close": f"eu_{symbol}_close",
+            "开盘价": f"eu_{symbol}_open", "open": f"eu_{symbol}_open",
+        })
+        df["date"] = pd.to_datetime(df["date"])
+        keep_cols = ["date", f"eu_{symbol}_close", f"eu_{symbol}_open"]
+        df = df[[c for c in keep_cols if c in df.columns]]
+        df = df.sort_values("date").reset_index(drop=True)
+        return df
+    except Exception as e:
+        print(f"  [警告] 获取 {name} 数据失败: {e}")
+        return pd.DataFrame()
+
+
 def fetch_shibor() -> pd.DataFrame:
     """获取 SHIBOR 利率数据。"""
     print("  获取 SHIBOR 利率数据 ...")
@@ -275,13 +332,13 @@ def fetch_all_data(start_date: str = "20180101") -> dict:
     data = {}
 
     # 1. A股指数数据
-    print("[1/7] 获取A股指数数据 ...")
+    print("[1/10] 获取A股指数数据 ...")
     for name, code in INDEX_CODES.items():
         data[name] = fetch_index_daily(code, name, start_date)
         time.sleep(0.5)
 
     # 2. 美股指数
-    print("[2/7] 获取美股指数数据 ...")
+    print("[2/10] 获取美股指数数据 ...")
     overseas_dfs = []
     for name, symbol in OVERSEAS_INDICES.items():
         df = fetch_us_index_daily(symbol, name)
@@ -290,8 +347,8 @@ def fetch_all_data(start_date: str = "20180101") -> dict:
         time.sleep(0.5)
     data["overseas"] = overseas_dfs
 
-    # 3. 港股期货（夜盘交易至01:00，比现货更好的隔夜参考）
-    print("[3/8] 获取港股期货数据 ...")
+    # 3. 港股期货
+    print("[3/10] 获取港股期货数据 ...")
     hk_dfs = []
     for name, symbol in HK_FUTURES.items():
         df = fetch_hk_futures_daily(symbol, name)
@@ -300,13 +357,13 @@ def fetch_all_data(start_date: str = "20180101") -> dict:
         time.sleep(0.5)
     data["hk"] = hk_dfs
 
-    # 4. 富时A50期货（夜盘至04:45，A股最直接的隔夜参考）
-    print("[4/8] 获取富时A50期货数据 ...")
+    # 4. 富时A50期货
+    print("[4/10] 获取富时A50期货数据 ...")
     data["a50"] = fetch_a50_futures()
     time.sleep(0.5)
 
-    # 5. 美国上市中国ETF（美股时段交易，反映海外资金对A股的定价）
-    print("[5/8] 获取美股中国相关ETF数据 ...")
+    # 5. 美国上市中国ETF
+    print("[5/10] 获取美股中国相关ETF数据 ...")
     china_etf_dfs = []
     for name, symbol in US_CHINA_ETFS.items():
         df = fetch_us_china_etf(symbol, name)
@@ -315,11 +372,23 @@ def fetch_all_data(start_date: str = "20180101") -> dict:
         time.sleep(0.5)
     data["china_etfs"] = china_etf_dfs
 
-    # 6. 大宗商品、汇率、VIX
-    print("[6/8] 获取大宗商品、汇率、VIX数据 ...")
+    # 6. 欧洲指数（收盘于北京时间次日 ~00:30-01:00）
+    print("[6/10] 获取欧洲指数数据 ...")
+    euro_dfs = []
+    for name, symbol in EURO_INDICES.items():
+        df = fetch_euro_index(symbol, name)
+        if not df.empty:
+            euro_dfs.append(df)
+        time.sleep(0.5)
+    data["euro"] = euro_dfs
+
+    # 7. 大宗商品、汇率、VIX
+    print("[7/10] 获取大宗商品、汇率、VIX数据 ...")
     data["gold"] = fetch_gold_price()
     time.sleep(0.5)
     data["usd_cny"] = fetch_usd_cny()
+    time.sleep(0.5)
+    data["usd_cnh"] = fetch_offshore_cnh()
     time.sleep(0.5)
 
     commodity_dfs = []
@@ -333,13 +402,13 @@ def fetch_all_data(start_date: str = "20180101") -> dict:
     data["vix"] = fetch_vix()
     time.sleep(0.5)
 
-    # 7. 美债收益率
-    print("[7/8] 获取美债收益率数据 ...")
+    # 8. 美债收益率
+    print("[8/10] 获取美债收益率数据 ...")
     data["us_treasury"] = fetch_us_treasury_yield()
     time.sleep(0.5)
 
-    # 8. 利率数据
-    print("[8/8] 获取利率数据 ...")
+    # 9. 利率数据
+    print("[9/10] 获取利率数据 ...")
     data["shibor"] = fetch_shibor()
 
     return data

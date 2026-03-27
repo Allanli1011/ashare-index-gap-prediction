@@ -187,6 +187,8 @@ def run_pipeline():
             vix_df=data.get("vix", pd.DataFrame()),
             us_treasury_df=data.get("us_treasury", pd.DataFrame()),
             china_etf_dfs=data.get("china_etfs", []),
+            euro_dfs=data.get("euro", []),
+            usd_cnh_df=data.get("usd_cnh", pd.DataFrame()),
         )
 
         feature_cols = get_feature_columns(df)

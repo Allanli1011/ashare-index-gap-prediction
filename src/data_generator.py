@@ -268,7 +268,7 @@ def generate_all_data() -> dict:
     """生成所有模拟数据。"""
     from src.data_fetcher import (
         INDEX_CODES, OVERSEAS_INDICES, HK_FUTURES,
-        US_CHINA_ETFS, COMMODITY_FUTURES,
+        US_CHINA_ETFS, COMMODITY_FUTURES, EURO_INDICES,
     )
 
     data = {}
@@ -365,10 +365,30 @@ def generate_all_data() -> dict:
     print("[模拟模式] 生成美债收益率数据 ...")
     data["us_treasury"] = generate_treasury_data()
 
-    # 黄金、汇率、SHIBOR
+    # 欧洲指数
+    print("[模拟模式] 生成欧洲指数数据 ...")
+    euro_dfs = []
+    euro_configs = {
+        "STOXX50": {"initial_price": 3400, "annual_vol": 0.20, "seed": 150},
+        "DAX": {"initial_price": 12000, "annual_vol": 0.22, "seed": 151},
+        "FTSE": {"initial_price": 7200, "annual_vol": 0.18, "seed": 152},
+    }
+    for symbol in EURO_INDICES.values():
+        cfg = euro_configs[symbol]
+        euro_dfs.append(generate_generic_asset_data(
+            prefix=f"eu_{symbol}",
+            initial_price=cfg["initial_price"],
+            annual_vol=cfg["annual_vol"],
+            seed=cfg["seed"],
+        ))
+    data["euro"] = euro_dfs
+
+    # 黄金、汇率（在岸+离岸）、SHIBOR
     print("[模拟模式] 生成商品、汇率、利率数据 ...")
     data["gold"] = generate_gold_data()
     data["usd_cny"] = generate_fx_data()
+    data["usd_cnh"] = generate_fx_data(seed=301)  # 离岸人民币（略不同的种子）
+    data["usd_cnh"] = data["usd_cnh"].rename(columns={"usd_cny": "usd_cnh"})
     data["shibor"] = generate_shibor_data()
 
     return data
