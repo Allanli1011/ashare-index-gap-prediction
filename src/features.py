@@ -100,40 +100,115 @@ def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _merge_overnight_df(df: pd.DataFrame, odf: pd.DataFrame, shift_days: int = 1) -> pd.DataFrame:
+    """合并隔夜数据，计算涨跌幅并对齐日期。
+
+    Args:
+        shift_days: 日期前移天数。美股/期货=1（T日收盘对应A股T+1日开盘前），
+                    港股=0（港股与A股同日交易，但港股收盘晚于A股，
+                    因此港股 T日收盘可用于 A股 T+1日预测，也需要shift）。
+    """
+    if odf is None or odf.empty:
+        return df
+    odf = odf.copy()
+    cols = [c for c in odf.columns if c != "date"]
+    for col in cols:
+        if "close" in col:
+            odf[col.replace("close", "ret")] = odf[col].pct_change() * 100
+    if shift_days > 0:
+        odf["date"] = odf["date"] + pd.Timedelta(days=shift_days)
+    return pd.merge_asof(
+        df.sort_values("date"),
+        odf.sort_values("date"),
+        on="date",
+        direction="backward",
+    )
+
+
 def add_overnight_features(
     df: pd.DataFrame,
     overseas_dfs: list[pd.DataFrame],
     gold_df: pd.DataFrame,
     usd_cny_df: pd.DataFrame,
     shibor_df: pd.DataFrame,
+    hk_dfs: list[pd.DataFrame] | None = None,
+    a50_df: pd.DataFrame | None = None,
+    commodity_dfs: list[pd.DataFrame] | None = None,
+    vix_df: pd.DataFrame | None = None,
+    us_treasury_df: pd.DataFrame | None = None,
+    china_etf_dfs: list[pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
     """添加隔夜因子特征（海外市场、商品、汇率等）。
 
-    关键：A股隔夜期间，美股是正常交易时段。
-    用美股当日收盘数据对齐到A股次日（即A股开盘前已知的信息）。
+    关键时间线（北京时间）：
+    - 港股现货收盘 16:00 → A股次日开盘前可用
+    - 港股期货夜盘收盘 01:00 次日 → A股次日开盘前可用（包含美股开盘后信息）
+    - 新加坡A50期货夜盘收盘 04:45 次日 → A股次日开盘前可用（最接近A股开盘的参考）
+    - 美股收盘 ~04:00 次日 → A股次日开盘前可用
+    - 美股中国ETF（ASHR/FXI/KWEB/MCHI）→ 反映海外资金对A股的隔夜定价
     """
     df = df.copy()
 
-    # 合并海外市场数据
+    # === 美股指数（T日收盘 → A股T+1日） ===
     for odf in overseas_dfs:
-        if odf.empty:
-            continue
-        # 美股 T 日收盘 → 对应 A股 T+1 日开盘前信息
-        odf = odf.copy()
-        cols = [c for c in odf.columns if c != "date"]
-        # 计算美股涨跌幅
-        for col in cols:
-            if "close" in col:
-                odf[col.replace("close", "ret")] = odf[col].pct_change() * 100
-        odf["date"] = odf["date"] + pd.Timedelta(days=1)  # 移到下一日对齐
+        df = _merge_overnight_df(df, odf, shift_days=1)
+
+    # === 美股中国相关ETF（T日收盘 → A股T+1日，反映海外资金对A股/中概股隔夜定价） ===
+    if china_etf_dfs:
+        for odf in china_etf_dfs:
+            df = _merge_overnight_df(df, odf, shift_days=1)
+
+    # === 港股期货（T日夜盘收盘 → A股T+1日，夜盘包含了美股开盘后的信息） ===
+    if hk_dfs:
+        for odf in hk_dfs:
+            df = _merge_overnight_df(df, odf, shift_days=1)
+
+    # === 富时A50期货（最直接的A股隔夜参考） ===
+    if a50_df is not None and not a50_df.empty:
+        a50 = a50_df.copy()
+        a50["a50_ret"] = a50["a50_close"].pct_change() * 100
+        a50["date"] = a50["date"] + pd.Timedelta(days=1)
         df = pd.merge_asof(
             df.sort_values("date"),
-            odf.sort_values("date"),
+            a50.sort_values("date"),
             on="date",
             direction="backward",
         )
 
-    # 黄金
+    # === 大宗商品期货（原油、铜等） ===
+    if commodity_dfs:
+        for odf in commodity_dfs:
+            df = _merge_overnight_df(df, odf, shift_days=1)
+
+    # === VIX 恐慌指数 ===
+    if vix_df is not None and not vix_df.empty:
+        vix = vix_df.copy()
+        vix["vix_ret"] = vix["vix_close"].pct_change() * 100
+        vix["vix_level"] = vix["vix_close"]  # VIX绝对水平也有意义
+        vix["date"] = vix["date"] + pd.Timedelta(days=1)
+        df = pd.merge_asof(
+            df.sort_values("date"),
+            vix[["date", "vix_close", "vix_ret", "vix_level"]].sort_values("date"),
+            on="date",
+            direction="backward",
+        )
+
+    # === 美债收益率 ===
+    if us_treasury_df is not None and not us_treasury_df.empty:
+        tsy = us_treasury_df.copy()
+        if "us10y_yield" in tsy.columns:
+            tsy["us10y_yield_chg"] = tsy["us10y_yield"].diff()
+        if "us_term_spread" in tsy.columns:
+            tsy["term_spread_chg"] = tsy["us_term_spread"].diff()
+        tsy["date"] = tsy["date"] + pd.Timedelta(days=1)
+        df = pd.merge_asof(
+            df.sort_values("date"),
+            tsy.sort_values("date"),
+            on="date",
+            direction="backward",
+        )
+
+    # === 黄金 ===
     if gold_df is not None and not gold_df.empty:
         gold = gold_df.copy()
         gold["gold_ret"] = gold["gold_price"].pct_change() * 100
@@ -144,7 +219,7 @@ def add_overnight_features(
             direction="backward",
         )
 
-    # 汇率
+    # === 汇率 ===
     if usd_cny_df is not None and not usd_cny_df.empty:
         fx = usd_cny_df.copy()
         fx["usd_cny_ret"] = fx["usd_cny"].pct_change() * 100
@@ -155,7 +230,7 @@ def add_overnight_features(
             direction="backward",
         )
 
-    # SHIBOR
+    # === SHIBOR ===
     if shibor_df is not None and not shibor_df.empty:
         df = pd.merge_asof(
             df.sort_values("date"),
@@ -173,6 +248,12 @@ def build_features(
     gold_df: pd.DataFrame,
     usd_cny_df: pd.DataFrame,
     shibor_df: pd.DataFrame,
+    hk_dfs: list[pd.DataFrame] | None = None,
+    a50_df: pd.DataFrame | None = None,
+    commodity_dfs: list[pd.DataFrame] | None = None,
+    vix_df: pd.DataFrame | None = None,
+    us_treasury_df: pd.DataFrame | None = None,
+    china_etf_dfs: list[pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
     """构建完整特征集。"""
     df = index_df.copy()
@@ -187,7 +268,12 @@ def build_features(
     df = add_calendar_features(df)
 
     # 4. 隔夜因子
-    df = add_overnight_features(df, overseas_dfs, gold_df, usd_cny_df, shibor_df)
+    df = add_overnight_features(
+        df, overseas_dfs, gold_df, usd_cny_df, shibor_df,
+        hk_dfs=hk_dfs, a50_df=a50_df, commodity_dfs=commodity_dfs,
+        vix_df=vix_df, us_treasury_df=us_treasury_df,
+        china_etf_dfs=china_etf_dfs,
+    )
 
     # 5. 所有特征向后移一期（确保使用前一日信息预测当日开盘跳空）
     target_col = "gap_pct"

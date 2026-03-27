@@ -185,12 +185,95 @@ def generate_shibor_data(
     return df
 
 
+def generate_generic_asset_data(
+    prefix: str,
+    start_date: str = "2018-01-02",
+    end_date: str = "2025-12-31",
+    initial_price: float = 1000.0,
+    annual_vol: float = 0.20,
+    seed: int = 500,
+) -> pd.DataFrame:
+    """生成通用资产价格数据。"""
+    rng = np.random.RandomState(seed)
+    dates = pd.bdate_range(start=start_date, end=end_date, freq="B")
+    n = len(dates)
+
+    daily_sigma = annual_vol / np.sqrt(252)
+    log_returns = rng.normal(0.05 / 252, daily_sigma, n)
+    close_prices = initial_price * np.exp(np.cumsum(log_returns))
+    open_prices = close_prices * (1 + rng.normal(0, daily_sigma * 0.2, n))
+
+    df = pd.DataFrame({
+        "date": dates[:n],
+        f"{prefix}_close": np.round(close_prices, 2),
+        f"{prefix}_open": np.round(open_prices, 2),
+    })
+    return df
+
+
+def generate_vix_data(
+    start_date: str = "2018-01-02",
+    end_date: str = "2025-12-31",
+    seed: int = 600,
+) -> pd.DataFrame:
+    """生成模拟VIX数据（均值回复过程）。"""
+    rng = np.random.RandomState(seed)
+    dates = pd.bdate_range(start=start_date, end=end_date, freq="B")
+    n = len(dates)
+
+    vix = 18.0
+    vix_values = []
+    for _ in range(n):
+        vix += 0.05 * (18.0 - vix) + rng.normal(0, 1.5)
+        vix = max(9.0, min(vix, 80.0))
+        vix_values.append(vix)
+
+    return pd.DataFrame({
+        "date": dates[:n],
+        "vix_close": np.round(vix_values, 2),
+    })
+
+
+def generate_treasury_data(
+    start_date: str = "2018-01-02",
+    end_date: str = "2025-12-31",
+    seed: int = 700,
+) -> pd.DataFrame:
+    """生成模拟美债收益率数据。"""
+    rng = np.random.RandomState(seed)
+    dates = pd.bdate_range(start=start_date, end=end_date, freq="B")
+    n = len(dates)
+
+    y10 = 2.8
+    y2 = 2.5
+    y10_values, y2_values = [], []
+    for _ in range(n):
+        y10 += 0.02 * (3.0 - y10) + rng.normal(0, 0.05)
+        y2 += 0.02 * (2.5 - y2) + rng.normal(0, 0.04)
+        y10 = max(0.5, min(y10, 5.5))
+        y2 = max(0.2, min(y2, 5.5))
+        y10_values.append(y10)
+        y2_values.append(y2)
+
+    df = pd.DataFrame({
+        "date": dates[:n],
+        "us10y_yield": np.round(y10_values, 4),
+        "us2y_yield": np.round(y2_values, 4),
+    })
+    df["us_term_spread"] = np.round(df["us10y_yield"] - df["us2y_yield"], 4)
+    return df
+
+
 def generate_all_data() -> dict:
     """生成所有模拟数据。"""
-    from src.data_fetcher import INDEX_CODES, OVERSEAS_INDICES
+    from src.data_fetcher import (
+        INDEX_CODES, OVERSEAS_INDICES, HK_FUTURES,
+        US_CHINA_ETFS, COMMODITY_FUTURES,
+    )
 
     data = {}
 
+    # A股指数
     print("[模拟模式] 生成A股指数数据 ...")
     index_configs = {
         "沪深300": {"initial_price": 3500, "annual_vol": 0.22, "seed": 42},
@@ -201,7 +284,8 @@ def generate_all_data() -> dict:
         cfg = index_configs[name]
         data[name] = generate_index_data(name, **cfg)
 
-    print("[模拟模式] 生成海外市场数据 ...")
+    # 美股指数
+    print("[模拟模式] 生成美股指数数据 ...")
     overseas_dfs = []
     us_configs = {
         "SPX": {"initial_price": 2700, "seed": 100},
@@ -213,11 +297,78 @@ def generate_all_data() -> dict:
         overseas_dfs.append(generate_us_index_data(symbol, **cfg))
     data["overseas"] = overseas_dfs
 
-    print("[模拟模式] 生成商品和汇率数据 ...")
+    # 港股期货
+    print("[模拟模式] 生成港股期货数据 ...")
+    hk_dfs = []
+    hk_configs = {
+        "HSI": {"initial_price": 28000, "annual_vol": 0.22, "seed": 110},
+        "HSTECH": {"initial_price": 5000, "annual_vol": 0.35, "seed": 111},
+        "HSCEI": {"initial_price": 10000, "annual_vol": 0.25, "seed": 112},
+    }
+    for symbol in HK_FUTURES.values():
+        cfg = hk_configs[symbol]
+        hk_dfs.append(generate_generic_asset_data(
+            prefix=f"hk_{symbol}",
+            initial_price=cfg["initial_price"],
+            annual_vol=cfg["annual_vol"],
+            seed=cfg["seed"],
+        ))
+    data["hk"] = hk_dfs
+
+    # 富时A50期货
+    print("[模拟模式] 生成富时A50期货数据 ...")
+    a50 = generate_generic_asset_data(prefix="a50", initial_price=12000, annual_vol=0.24, seed=120)
+    data["a50"] = a50
+
+    # 美股中国ETF
+    print("[模拟模式] 生成美股中国ETF数据 ...")
+    etf_dfs = []
+    etf_configs = {
+        "FXI": {"initial_price": 42, "annual_vol": 0.28, "seed": 130},
+        "KWEB": {"initial_price": 55, "annual_vol": 0.38, "seed": 131},
+        "ASHR": {"initial_price": 28, "annual_vol": 0.25, "seed": 132},
+        "MCHI": {"initial_price": 65, "annual_vol": 0.28, "seed": 133},
+    }
+    for symbol in US_CHINA_ETFS.values():
+        cfg = etf_configs[symbol]
+        etf_dfs.append(generate_generic_asset_data(
+            prefix=f"etf_{symbol}",
+            initial_price=cfg["initial_price"],
+            annual_vol=cfg["annual_vol"],
+            seed=cfg["seed"],
+        ))
+    data["china_etfs"] = etf_dfs
+
+    # 大宗商品
+    print("[模拟模式] 生成大宗商品数据 ...")
+    cmd_dfs = []
+    cmd_configs = {
+        "CL": {"initial_price": 65, "annual_vol": 0.35, "seed": 140},
+        "OIL": {"initial_price": 70, "annual_vol": 0.33, "seed": 141},
+        "HG": {"initial_price": 3.0, "annual_vol": 0.25, "seed": 142},
+    }
+    for symbol in COMMODITY_FUTURES.values():
+        cfg = cmd_configs[symbol]
+        cmd_dfs.append(generate_generic_asset_data(
+            prefix=f"cmd_{symbol}",
+            initial_price=cfg["initial_price"],
+            annual_vol=cfg["annual_vol"],
+            seed=cfg["seed"],
+        ))
+    data["commodities"] = cmd_dfs
+
+    # VIX
+    print("[模拟模式] 生成VIX数据 ...")
+    data["vix"] = generate_vix_data()
+
+    # 美债收益率
+    print("[模拟模式] 生成美债收益率数据 ...")
+    data["us_treasury"] = generate_treasury_data()
+
+    # 黄金、汇率、SHIBOR
+    print("[模拟模式] 生成商品、汇率、利率数据 ...")
     data["gold"] = generate_gold_data()
     data["usd_cny"] = generate_fx_data()
-
-    print("[模拟模式] 生成利率数据 ...")
     data["shibor"] = generate_shibor_data()
 
     return data

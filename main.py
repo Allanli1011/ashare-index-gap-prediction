@@ -181,6 +181,12 @@ def run_pipeline():
             gold_df=data.get("gold", pd.DataFrame()),
             usd_cny_df=data.get("usd_cny", pd.DataFrame()),
             shibor_df=data.get("shibor", pd.DataFrame()),
+            hk_dfs=data.get("hk", []),
+            a50_df=data.get("a50", pd.DataFrame()),
+            commodity_dfs=data.get("commodities", []),
+            vix_df=data.get("vix", pd.DataFrame()),
+            us_treasury_df=data.get("us_treasury", pd.DataFrame()),
+            china_etf_dfs=data.get("china_etfs", []),
         )
 
         feature_cols = get_feature_columns(df)
