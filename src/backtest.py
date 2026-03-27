@@ -3,6 +3,7 @@
 """
 import numpy as np
 import pandas as pd
+from scipy.stats import spearmanr
 from .model import GapPredictor
 
 
@@ -13,7 +14,7 @@ def walk_forward_backtest(
     initial_train_days: int = 500,
     retrain_every: int = 20,
     val_ratio: float = 0.15,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """滚动窗口回测。
 
     Args:
@@ -25,12 +26,16 @@ def walk_forward_backtest(
         val_ratio: 验证集占训练集的比例。
 
     Returns:
-        包含日期、真实值、预测值的DataFrame。
+        (predictions_df, importance_history_df):
+        - predictions_df: 日期、真实值、预测值
+        - importance_history_df: 每次重训练的特征重要性记录
     """
     results = []
+    importance_records = []
     n = len(df)
     model = None
     last_train_idx = -retrain_every  # 强制第一次训练
+    retrain_count = 0
 
     for i in range(initial_train_days, n):
         # 是否需要重新训练
@@ -49,6 +54,14 @@ def walk_forward_backtest(
             model = GapPredictor()
             model.train(X_train, y_train, X_val, y_val)
             last_train_idx = i
+            retrain_count += 1
+
+            # 记录本次重训练的特征重要性
+            imp = model.feature_importance()
+            imp["retrain_id"] = retrain_count
+            imp["retrain_date"] = df.iloc[i]["date"]
+            imp["train_size"] = len(X_train)
+            importance_records.append(imp)
 
         # 预测
         X_test = df.iloc[[i]][feature_cols]
@@ -61,7 +74,10 @@ def walk_forward_backtest(
             "predicted": pred,
         })
 
-    return pd.DataFrame(results)
+    predictions_df = pd.DataFrame(results)
+    importance_df = pd.concat(importance_records, ignore_index=True) if importance_records else pd.DataFrame()
+
+    return predictions_df, importance_df
 
 
 def compute_metrics(results: pd.DataFrame) -> dict:
@@ -79,7 +95,6 @@ def compute_metrics(results: pd.DataFrame) -> dict:
     for i in range(window, len(results)):
         a = actual[i - window:i]
         p = predicted[i - window:i]
-        from scipy.stats import spearmanr
         corr, _ = spearmanr(a, p)
         if not np.isnan(corr):
             ic_list.append(corr)
@@ -135,7 +150,6 @@ def compute_daily_metrics_rolling(results: pd.DataFrame, window: int = 60) -> pd
         if i < window:
             ic_values.append(np.nan)
         else:
-            from scipy.stats import spearmanr
             a = out["actual"].iloc[i - window:i].values
             p = out["predicted"].iloc[i - window:i].values
             corr, _ = spearmanr(a, p)
@@ -143,3 +157,30 @@ def compute_daily_metrics_rolling(results: pd.DataFrame, window: int = 60) -> pd
     out["rolling_ic"] = ic_values
 
     return out
+
+
+def summarize_feature_importance(importance_df: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
+    """汇总所有重训练窗口的特征重要性，计算平均排名和稳定性。"""
+    if importance_df.empty:
+        return pd.DataFrame()
+
+    # 每次重训练中每个特征的排名
+    def rank_within_group(group):
+        group = group.copy()
+        group["rank"] = group["importance"].rank(ascending=False)
+        return group
+
+    ranked = importance_df.groupby("retrain_id", group_keys=False).apply(rank_within_group)
+
+    summary = ranked.groupby("feature").agg(
+        avg_importance=("importance", "mean"),
+        avg_rank=("rank", "mean"),
+        rank_std=("rank", "std"),
+        times_in_top10=("rank", lambda x: (x <= 10).sum()),
+        total_retrains=("rank", "count"),
+    ).reset_index()
+
+    summary["top10_rate"] = summary["times_in_top10"] / summary["total_retrains"]
+    summary = summary.sort_values("avg_rank").reset_index(drop=True)
+
+    return summary.head(top_n)
