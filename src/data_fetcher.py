@@ -102,11 +102,12 @@ def fetch_gold_price() -> pd.DataFrame:
     """获取黄金价格数据。"""
     print("  获取黄金价格数据 ...")
     try:
-        df = ak.spot_golden_benchmark_sge(
-            start_date="20180101",
-            end_date=pd.Timestamp.now().strftime("%Y%m%d"),
-        )
-        df = df.rename(columns={"日期": "date", "价格": "gold_price"})
+        df = ak.spot_golden_benchmark_sge()
+        df = df.rename(columns={"交易时间": "date", "晚盘价": "gold_price"})
+        # 晚盘价如果没有, 尝试用早盘价
+        if "gold_price" in df.columns and "早盘价" in df.columns:
+            df["gold_price"] = df["gold_price"].fillna(df["早盘价"])
+            
         df["date"] = pd.to_datetime(df["date"])
         df = df[["date", "gold_price"]].sort_values("date").reset_index(drop=True)
         return df
@@ -124,12 +125,8 @@ def fetch_usd_cny() -> pd.DataFrame:
         if not usd_row.empty:
             print("  [信息] 获取到实时汇率快照")
         # 使用央行汇率中间价作为替代
-        df = ak.currency_boc_safe(
-            symbol="美元",
-            start_date="20180101",
-            end_date=pd.Timestamp.now().strftime("%Y%m%d"),
-        )
-        df = df.rename(columns={"日期": "date", "中行汇买价": "usd_cny"})
+        df = ak.currency_boc_safe()
+        df = df.rename(columns={"日期": "date", "美元": "usd_cny"})
         df["date"] = pd.to_datetime(df["date"])
         df["usd_cny"] = pd.to_numeric(df["usd_cny"], errors="coerce")
         df = df[["date", "usd_cny"]].dropna().sort_values("date").reset_index(drop=True)
@@ -506,13 +503,9 @@ def fetch_offshore_cnh() -> pd.DataFrame:
     """
     print("  获取离岸人民币 (USD/CNH) 数据 ...")
     try:
-        df = ak.currency_boc_safe(
-            symbol="美元",
-            start_date="20180101",
-            end_date=pd.Timestamp.now().strftime("%Y%m%d"),
-        )
-        # 中行卖出价更接近离岸市场报价
-        df = df.rename(columns={"日期": "date", "中行钞卖价": "usd_cnh"})
+        df = ak.currency_boc_safe()
+        # 由于安全保护的数据只有中间价，我们就直接提取中间价。虽然没离岸纯正，但也算个替代
+        df = df.rename(columns={"日期": "date", "美元": "usd_cnh"})
         df["date"] = pd.to_datetime(df["date"])
         df["usd_cnh"] = pd.to_numeric(df["usd_cnh"], errors="coerce")
         df = df[["date", "usd_cnh"]].dropna().sort_values("date").reset_index(drop=True)
@@ -551,7 +544,7 @@ def fetch_shibor() -> pd.DataFrame:
     """获取 SHIBOR 利率数据。"""
     print("  获取 SHIBOR 利率数据 ...")
     try:
-        df = ak.rate_interbank(market="上海银行间同业拆放利率(Shibor)", symbol="隔夜", indicator="利率")
+        df = ak.rate_interbank(market="上海银行同业拆借市场", symbol="Shibor人民币", indicator="隔夜")
         df = df.rename(columns={"报告日": "date", "利率": "shibor_on"})
         df["date"] = pd.to_datetime(df["date"])
         df["shibor_on"] = pd.to_numeric(df["shibor_on"], errors="coerce")

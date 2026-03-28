@@ -1,6 +1,7 @@
 """
 模型模块：LightGBM 回归模型用于预测开盘跳空幅度。
 """
+from __future__ import annotations
 import numpy as np
 import pandas as pd
 import lightgbm as lgb

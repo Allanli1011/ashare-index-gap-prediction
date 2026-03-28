@@ -1,6 +1,7 @@
 """
 特征工程模块：构建用于预测开盘跳空幅度的特征。
 """
+from __future__ import annotations
 import numpy as np
 import pandas as pd
 
