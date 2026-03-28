@@ -1,7 +1,10 @@
 """
 数据获取模块：通过 akshare 获取A股指数数据和隔夜因子数据。
 """
+import json
 import time
+import urllib.request
+
 import pandas as pd
 import akshare as ak
 
@@ -187,6 +190,130 @@ def fetch_us_china_etf(symbol: str, name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+# ============================================================
+# Sina 未封装 API：外盘期货分钟级 K 线
+# ============================================================
+# akshare 只封装了日线接口 (futures_foreign_hist)，
+# 但 Sina Finance 有未封装的分钟级 K 线接口，可用于获取 A50 等外盘期货的小时线。
+# 通过提取日盘开盘时段 (09:00) 的 bar，可以得到真实的日盘开盘价。
+
+# Sina 外盘期货 symbol 映射（与 akshare 的 symbol 不同）
+SINA_FUTURES_SYMBOLS = {
+    "A50": "CHA50CFD",       # 富时中国A50期货 CFD
+    "HSI": "CHSICFD",        # 恒生指数期货 CFD
+    "HSTECH": "CHSTECHCFD",  # 恒生科技指数期货 CFD (may not exist)
+    "CL": "CLCFD",           # WTI 原油 CFD
+    "OIL": "CONC",           # 布伦特原油 CFD
+    "HG": "HGCFD",           # COMEX 铜 CFD
+}
+
+
+def _fetch_sina_futures_hourly(sina_symbol: str) -> pd.DataFrame:
+    """通过 Sina Finance 未封装 API 获取外盘期货 60 分钟 K 线数据。
+
+    API: http://stock2.finance.sina.com.cn/futures/api/json.php/
+         GlobalFuturesService.getGlobalFuturesMiniKLine60m?symbol={symbol}
+
+    返回数据格式: JSON array of arrays
+    每条: [datetime_str, open, high, low, close, volume]
+    datetime_str 格式: "2024-03-15 09:00:00" (新加坡/北京时间)
+
+    注意: 该接口仅返回近几个月的数据，不适合完整历史回测，
+    但对于增量获取近期的日盘开盘价非常有用。
+    """
+    url = (
+        "https://stock2.finance.sina.com.cn/futures/api/json.php/"
+        f"GlobalFuturesService.getGlobalFuturesMiniKLine60m?symbol={sina_symbol}"
+    )
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://finance.sina.com.cn/",
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8")
+
+        # Sina 返回的 JSON 可能有 JS 变量名包裹，先尝试直接解析
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            # 尝试提取 JSON 数组部分
+            start = raw.find("[")
+            end = raw.rfind("]") + 1
+            if start >= 0 and end > start:
+                data = json.loads(raw[start:end])
+            else:
+                return pd.DataFrame()
+
+        if not data or not isinstance(data, list):
+            return pd.DataFrame()
+
+        # 解析为 DataFrame
+        records = []
+        for row in data:
+            if isinstance(row, list) and len(row) >= 5:
+                records.append({
+                    "datetime": row[0],
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": float(row[5]) if len(row) > 5 else 0,
+                })
+            elif isinstance(row, dict):
+                records.append({
+                    "datetime": row.get("d", row.get("date", "")),
+                    "open": float(row.get("o", row.get("open", 0))),
+                    "high": float(row.get("h", row.get("high", 0))),
+                    "low": float(row.get("l", row.get("low", 0))),
+                    "close": float(row.get("c", row.get("close", 0))),
+                    "volume": float(row.get("v", row.get("volume", 0))),
+                })
+
+        if not records:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(records)
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.sort_values("datetime").reset_index(drop=True)
+        return df
+
+    except Exception as e:
+        print(f"  [警告] Sina 小时线 API 调用失败 ({sina_symbol}): {e}")
+        return pd.DataFrame()
+
+
+def _extract_day_session_opens(
+    hourly_df: pd.DataFrame,
+    day_session_start_hour: int = 9,
+) -> pd.DataFrame:
+    """从小时线数据中提取每个交易日的日盘开盘价。
+
+    Args:
+        hourly_df: 小时线 DataFrame，需要有 datetime/open 列
+        day_session_start_hour: 日盘开盘时间的小时数 (默认 9 = 09:00)
+
+    Returns:
+        DataFrame with columns: [date, day_session_open]
+        date 为交易日日期，day_session_open 为日盘开盘价
+    """
+    if hourly_df.empty or "datetime" not in hourly_df.columns:
+        return pd.DataFrame()
+
+    # 筛选日盘开盘时段的 bar (09:00-09:59)
+    mask = hourly_df["datetime"].dt.hour == day_session_start_hour
+    day_bars = hourly_df[mask].copy()
+
+    if day_bars.empty:
+        return pd.DataFrame()
+
+    # 每天取第一根 bar 的 open 作为日盘开盘价
+    day_bars["date"] = day_bars["datetime"].dt.normalize()
+    result = day_bars.groupby("date")["open"].first().reset_index()
+    result.columns = ["date", "day_session_open"]
+    return result
+
+
 def _detect_open_convention(df: pd.DataFrame, open_col: str, close_col: str) -> str:
     """经验检测期货日线 open 代表日盘开盘还是夜盘开盘。
 
@@ -224,13 +351,14 @@ def fetch_a50_futures() -> pd.DataFrame:
     2. 如果 open = 夜盘开盘 → night_ret 会接近 0，模型自动忽略
     3. 依赖 close-to-close return（a50_ret）和其他产品（ASHR、HK现货）获取隔夜信号
 
-    增强策略（尝试获取日盘真实开盘价）：
-    1. yfinance 小时线数据 → 提取 09:00 bar 的开盘价
-    2. 如成功，替换 a50_open 为真实的日盘开盘价
+    增强策略（按优先级尝试获取日盘真实开盘价）：
+    1. Sina 未封装 API 小时线 → 提取 09:00 bar（最直接，无需额外依赖）
+    2. yfinance 小时线数据 → 提取 09:00 bar（需安装 yfinance，~730天历史）
+    3. 如均失败 → 使用日线数据，由 features.py 的 split-merge 兜底
     """
     print("  获取富时A50期货数据 ...")
 
-    # 策略1: 基础日线数据 (akshare)
+    # 基础数据: akshare 日线
     a50_daily = pd.DataFrame()
     try:
         a50_daily = ak.futures_foreign_hist(symbol="A50")
@@ -251,53 +379,63 @@ def fetch_a50_futures() -> pd.DataFrame:
         convention = _detect_open_convention(a50_daily, "a50_open", "a50_close")
         print(f"  [检测] A50 open 价格含义: {convention}")
         if convention == "night_session_open":
-            print("  [提示] open 为夜盘开盘价，night_ret 将接近0，尝试获取日盘开盘价 ...")
+            print("  [提示] open 为夜盘开盘价，尝试获取日盘真实开盘价 ...")
 
-    # 策略2: 用 yfinance 小时线提取真正的日盘开盘价(09:00)
-    try:
-        import yfinance as yf
-        print("  [尝试] 通过 yfinance 获取 A50 小时线数据 ...")
-        ticker = yf.Ticker("CN=F")  # FTSE China A50 Futures
-        # yfinance 小时线最多 ~730 天历史
-        hourly = ticker.history(period="max", interval="1h")
-        if not hourly.empty:
-            hourly = hourly.reset_index()
-            dt_col = "Datetime" if "Datetime" in hourly.columns else "Date"
-            hourly["date"] = pd.to_datetime(hourly[dt_col]).dt.tz_localize(None)
-            # 提取日盘开盘价: 09:00-09:59 的第一根 bar
-            day_open = hourly[hourly["date"].dt.hour == 9].copy()
-            day_open["trade_date"] = day_open["date"].dt.date
-            day_open = day_open.groupby("trade_date").first().reset_index()
-            day_open["date"] = pd.to_datetime(day_open["trade_date"])
-            day_open = day_open[["date", "Open"]].rename(columns={"Open": "a50_day_open"})
+    # ------------------------------------------------------------------
+    # 增强策略: 尝试获取日盘真实开盘价 (09:00) 替换日线中的 open
+    # ------------------------------------------------------------------
+    day_opens = pd.DataFrame()
 
-            # 合并到日线数据，用 a50_day_open 替换 a50_open
-            if not a50_daily.empty:
-                merged = pd.merge(a50_daily, day_open, on="date", how="left")
-                has_day_open = merged["a50_day_open"].notna().sum()
-                print(f"  [yfinance] 获取到 {has_day_open} 天的日盘真实开盘价")
-                # 有日盘开盘价的行用真实值替换
-                mask = merged["a50_day_open"].notna()
-                merged.loc[mask, "a50_open"] = merged.loc[mask, "a50_day_open"]
-                merged = merged.drop(columns=["a50_day_open"])
-                return merged
-            else:
-                # 没有日线数据，仅用 yfinance
-                daily_from_hourly = hourly.groupby(
-                    hourly["date"].dt.date
-                ).agg({"Open": "first", "Close": "last"}).reset_index()
-                daily_from_hourly.columns = ["date", "a50_open", "a50_close"]
-                daily_from_hourly["date"] = pd.to_datetime(daily_from_hourly["date"])
-                return daily_from_hourly.sort_values("date").reset_index(drop=True)
-    except ImportError:
-        print("  [提示] yfinance 未安装，跳过小时线数据获取")
-    except Exception as e:
-        print(f"  [警告] yfinance A50数据获取失败: {e}")
+    # 策略1: Sina 未封装 API 小时线（优先，无需额外依赖）
+    if day_opens.empty:
+        sina_symbol = SINA_FUTURES_SYMBOLS.get("A50", "CHA50CFD")
+        print(f"  [尝试] Sina 小时线 API ({sina_symbol}) ...")
+        hourly_sina = _fetch_sina_futures_hourly(sina_symbol)
+        if not hourly_sina.empty:
+            day_opens = _extract_day_session_opens(hourly_sina, day_session_start_hour=9)
+            if not day_opens.empty:
+                print(f"  [Sina] 获取到 {len(day_opens)} 天的日盘真实开盘价")
+
+    # 策略2: yfinance 小时线（作为备选）
+    if day_opens.empty:
+        try:
+            import yfinance as yf
+            print("  [尝试] yfinance 小时线 (CN=F) ...")
+            ticker = yf.Ticker("CN=F")
+            hourly_yf = ticker.history(period="max", interval="1h")
+            if not hourly_yf.empty:
+                hourly_yf = hourly_yf.reset_index()
+                dt_col = "Datetime" if "Datetime" in hourly_yf.columns else "Date"
+                hourly_yf["datetime"] = pd.to_datetime(hourly_yf[dt_col])
+                if hourly_yf["datetime"].dt.tz is not None:
+                    hourly_yf["datetime"] = hourly_yf["datetime"].dt.tz_localize(None)
+                hourly_yf = hourly_yf.rename(columns={"Open": "open"})
+                day_opens = _extract_day_session_opens(hourly_yf, day_session_start_hour=9)
+                if not day_opens.empty:
+                    print(f"  [yfinance] 获取到 {len(day_opens)} 天的日盘真实开盘价")
+        except ImportError:
+            print("  [提示] yfinance 未安装，跳过")
+        except Exception as e:
+            print(f"  [警告] yfinance 获取失败: {e}")
+
+    # 将日盘开盘价合并到日线数据
+    if not day_opens.empty and not a50_daily.empty:
+        merged = pd.merge(a50_daily, day_opens, on="date", how="left")
+        n_replaced = merged["day_session_open"].notna().sum()
+        if n_replaced > 0:
+            mask = merged["day_session_open"].notna()
+            merged.loc[mask, "a50_open"] = merged.loc[mask, "day_session_open"]
+            print(f"  [替换] {n_replaced} 天的 a50_open 已替换为日盘真实开盘价")
+            # 重新检测替换后的 open 含义
+            conv_after = _detect_open_convention(merged, "a50_open", "a50_close")
+            print(f"  [验证] 替换后 open 价格含义: {conv_after}")
+        merged = merged.drop(columns=["day_session_open"])
+        return merged
 
     if not a50_daily.empty:
         return a50_daily
 
-    print(f"  [警告] 获取A50期货数据失败")
+    print("  [警告] 获取A50期货数据失败")
     return pd.DataFrame()
 
 
