@@ -267,7 +267,7 @@ def generate_treasury_data(
 def generate_all_data() -> dict:
     """生成所有模拟数据。"""
     from src.data_fetcher import (
-        INDEX_CODES, OVERSEAS_INDICES, HK_FUTURES,
+        INDEX_CODES, OVERSEAS_INDICES, HK_INDICES,
         US_CHINA_ETFS, COMMODITY_FUTURES, EURO_INDICES,
     )
 
@@ -297,15 +297,15 @@ def generate_all_data() -> dict:
         overseas_dfs.append(generate_us_index_data(symbol, **cfg))
     data["overseas"] = overseas_dfs
 
-    # 港股期货
-    print("[模拟模式] 生成港股期货数据 ...")
+    # 港股现货指数（非期货，open = 早盘开盘 09:15）
+    print("[模拟模式] 生成港股现货指数数据 ...")
     hk_dfs = []
     hk_configs = {
         "HSI": {"initial_price": 28000, "annual_vol": 0.22, "seed": 110},
         "HSTECH": {"initial_price": 5000, "annual_vol": 0.35, "seed": 111},
         "HSCEI": {"initial_price": 10000, "annual_vol": 0.25, "seed": 112},
     }
-    for symbol in HK_FUTURES.values():
+    for symbol in HK_INDICES.values():
         cfg = hk_configs[symbol]
         hk_dfs.append(generate_generic_asset_data(
             prefix=f"hk_{symbol}",

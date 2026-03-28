@@ -236,23 +236,23 @@ def add_overnight_features(
     - 欧洲指数:        收盘于北京时间 d+1 凌晨 ~00:30-01:00 ✓
     - 离岸人民币CNH:   24小时交易，日结算以美国时间为准 ✓
 
-    【港股/A50 期货的夜盘数据 — 关键修正】
-    问题：akshare 日线的 open 价格含义不确定
-    - 情况A: open = 日盘开盘价（A50 09:00, 恒指 09:15）
-    - 情况B: open = 夜盘开盘价（A50 前日17:00, 恒指 前日17:15）
+    【港股数据】
+    实际使用的是 akshare stock_hk_index_daily_sina → 现货指数（非期货）。
+    现货指数无夜盘，open = 早盘开盘(09:15 HKT)，close = 午盘收盘(16:00 HKT)。
+    open 在 A股 09:30 前 15 分钟已知 → 可直接用于预测，无歧义。
+    night_ret = open[T] / close[T-1] = 精确的隔夜涨跌幅。
 
-    如果是情况B，简单的 shift+1 会导致两个问题：
-    1. night_ret = open/close.shift(1) ≈ 0%（只是30分钟价差），无法捕捉隔夜涨跌
-    2. 即使是情况A，整体 shift+1 也会让 night_ret 延迟一天
+    【A50 期货 — open 价格含义不确定】
+    SGX 交易日: T+1 session(夜盘 17:00-04:45) + T session(日盘 09:00-16:30)
+    akshare 日线 open 大概率 = 夜盘开盘价(前日17:00)，非日盘开盘价(09:00)。
 
-    修正方案（_merge_futures_with_night_session）：
-    - close-based features (close, ret, day_ret): shift+1（日盘收盘晚于A股 → 次日用）
-    - open price: 不 shift（当日开盘在A股09:30前已知 → 当天可用）
-    - night_ret = 当日open / 前日close（merge后计算，避免shift错位）
-
-    结果：
-    - 情况A: night_ret 正确反映完整隔夜涨跌 ✓
-    - 情况B: night_ret ≈ 0，模型自动忽略，不引入错误信息 ✓
+    解决方案：
+    1. _merge_futures_with_night_session 分离 open(不shift) 和 close(shift+1)
+    2. data_fetcher.py 尝试用 yfinance 小时线获取真实的日盘开盘价
+    3. _detect_open_convention 经验检测 open 含义
+    4. 无论哪种情况，模型都能正确处理：
+       - open = 日盘开盘 → night_ret 反映完整隔夜涨跌 ✓
+       - open = 夜盘开盘 → night_ret ≈ 0%，模型自动忽略 ✓
     """
     df = df.copy()
 
@@ -269,10 +269,13 @@ def add_overnight_features(
         for odf in china_etf_dfs:
             df = _merge_overnight_df(df, odf, shift_days=1)
 
-    # === 港股期货（分离日盘/夜盘特征，修正时间对齐） ===
-    # 港股期货: 日盘 09:15-16:15, 夜盘 17:15-03:00 (北京时间)
-    # open 可能是日盘开盘(09:15)也可能是夜盘开盘(前晚17:15)
-    # 使用 _merge_futures_with_night_session 分离处理
+    # === 港股现货指数（非期货！open = 早盘开盘 09:15，无歧义） ===
+    # 数据来源: akshare stock_hk_index_daily_sina → 现货指数，无夜盘
+    # open[T] = 09:15 HKT 开盘价，在 A股 09:30 开盘前已知
+    # 使用 _merge_futures_with_night_session 将 open 和 close 分开处理：
+    # - close: shift+1（16:00 HKT 收盘 → 用于次日预测）
+    # - open: 不shift（09:15 HKT → 同日可用）
+    # - night_ret = open[T] / close[T-1]（精确的隔夜涨跌幅）
     if hk_dfs:
         for odf in hk_dfs:
             close_cols = [c for c in odf.columns if c.endswith("_close")]
@@ -282,10 +285,22 @@ def add_overnight_features(
             else:
                 df = _merge_overnight_df(df, odf, shift_days=1)
 
-    # === 富时A50期货（分离日盘/夜盘特征 — 最有价值的隔夜信号） ===
+    # === 富时A50期货（分离日盘/夜盘特征） ===
     # A50: 日盘 09:00-16:30, 夜盘 17:00-04:45 (北京时间)
-    # 夜盘跨越整个美股交易时段，是A股次日开盘最重要的参考
+    #
+    # open 的含义取决于数据源：
+    # - 如果 open = 日盘开盘(09:00) → night_ret 精确反映隔夜涨跌 ✓
+    # - 如果 open = 夜盘开盘(前日17:00) → night_ret ≈ 0% → 模型自动忽略
+    # - data_fetcher.py 中的 yfinance 小时线会尝试获取真实日盘开盘价
+    #
+    # _merge_futures_with_night_session 确保两种情况都能正确处理
     if a50_df is not None and not a50_df.empty:
+        from src.data_fetcher import _detect_open_convention
+        conv = _detect_open_convention(a50_df, "a50_open", "a50_close")
+        if conv == "night_session_open":
+            print(f"  [A50] open = 夜盘开盘价 → night_ret 将接近0，依赖 a50_ret 和其他产品")
+        elif conv == "day_session_open":
+            print(f"  [A50] open = 日盘开盘价 → night_ret 可精确衡量隔夜涨跌")
         df = _merge_futures_with_night_session(df, a50_df, "a50")
 
     # === 境外商品期货 ===

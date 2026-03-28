@@ -19,11 +19,12 @@ OVERSEAS_INDICES = {
     "道琼斯": "DJI",
 }
 
-# 港股期货（夜盘交易至次日01:00北京时间，比现货更好的隔夜参考）
-HK_FUTURES = {
-    "恒指期货": "HSI",      # 恒生指数期货，夜盘至01:00
-    "恒生科技期货": "HSTECH",  # 恒生科技指数期货
-    "国企指数期货": "HSCEI",   # H股指数期货
+# 港股现货指数（注意：akshare stock_hk_index_daily_sina 返回的是现货指数，非期货）
+# 现货指数无夜盘，open = 早盘开盘(09:15 HKT)，无歧义
+HK_INDICES = {
+    "恒生指数": "HSI",         # 恒生指数（现货），09:15-16:00
+    "恒生科技指数": "HSTECH",  # 恒生科技指数（现货）
+    "国企指数": "HSCEI",       # H股指数（现货）
 }
 
 # 富时A50期货（新加坡交易所，A股最直接的隔夜参考，夜盘至次日04:45）
@@ -135,15 +136,17 @@ def fetch_usd_cny() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def fetch_hk_futures_daily(symbol: str, name: str) -> pd.DataFrame:
-    """获取港股期货日线数据。
+def fetch_hk_index_daily(symbol: str, name: str) -> pd.DataFrame:
+    """获取港股现货指数日线数据。
 
-    港股期货夜盘交易至次日01:00（北京时间），比港股现货更好的隔夜参考。
-    夜盘收盘价反映了美股开盘后对港股/中概股的最新定价。
+    注意：akshare stock_hk_index_daily_sina 返回的是现货指数（非期货）。
+    现货指数无夜盘交易，因此：
+    - open = 早盘开盘价 (09:15 HKT = 09:15 BJT)，无歧义
+    - close = 午盘收盘价 (16:00 HKT = 16:00 BJT)
+    open 在 A股开盘(09:30)前 15 分钟已知，可直接用于预测。
     """
-    print(f"  获取 {name} 期货 ({symbol}) 数据 ...")
+    print(f"  获取 {name} 现货指数 ({symbol}) 数据 ...")
     try:
-        # 尝试通过港股指数接口获取
         df = ak.stock_hk_index_daily_sina(symbol=symbol)
         df = df.rename(columns={
             "date": "date",
@@ -184,24 +187,118 @@ def fetch_us_china_etf(symbol: str, name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _detect_open_convention(df: pd.DataFrame, open_col: str, close_col: str) -> str:
+    """经验检测期货日线 open 代表日盘开盘还是夜盘开盘。
+
+    原理：
+    - 如果 open = 日盘开盘(09:00)，open[d] 与 close[d-1](前日16:30) 之间隔了一整夜，
+      |open[d] - close[d-1]| / close[d-1] 的中位数通常 > 0.3%
+    - 如果 open = 夜盘开盘(前夜17:00)，与 close[d-1](同日16:30) 只隔30分钟，
+      |open[d] - close[d-1]| / close[d-1] 的中位数通常 < 0.1%
+    """
+    if open_col not in df.columns or close_col not in df.columns:
+        return "unknown"
+    gap = (df[open_col] / df[close_col].shift(1) - 1).abs() * 100
+    median_gap = gap.median()
+    if median_gap < 0.1:
+        return "night_session_open"
+    elif median_gap > 0.3:
+        return "day_session_open"
+    else:
+        return "ambiguous"
+
+
 def fetch_a50_futures() -> pd.DataFrame:
-    """获取富时中国A50期货数据（新加坡交易所）。"""
+    """获取富时中国A50期货数据（新加坡交易所）。
+
+    ===== 重要：open 价格的含义 =====
+    SGX 的交易日定义：
+    - T+1 session（夜盘）: 前日 17:00 → 当日 04:45
+    - T session（日盘）:   当日 09:00 → 当日 16:30
+
+    akshare 的 futures_foreign_hist 返回的日线 open 大概率是夜盘开盘价（前日17:00），
+    而非日盘开盘价（当日09:00）。这意味着 open[d+1]/close[d] ≈ 0%，无法衡量隔夜涨跌。
+
+    解决策略（features.py 中实现）：
+    1. 自动检测 open 的含义（经验分析 open-close 的价差分布）
+    2. 如果 open = 夜盘开盘 → night_ret 会接近 0，模型自动忽略
+    3. 依赖 close-to-close return（a50_ret）和其他产品（ASHR、HK现货）获取隔夜信号
+
+    增强策略（尝试获取日盘真实开盘价）：
+    1. yfinance 小时线数据 → 提取 09:00 bar 的开盘价
+    2. 如成功，替换 a50_open 为真实的日盘开盘价
+    """
     print("  获取富时A50期货数据 ...")
+
+    # 策略1: 基础日线数据 (akshare)
+    a50_daily = pd.DataFrame()
     try:
-        df = ak.futures_foreign_hist(symbol="A50")
-        df = df.rename(columns={
+        a50_daily = ak.futures_foreign_hist(symbol="A50")
+        a50_daily = a50_daily.rename(columns={
             "date": "date", "日期": "date",
             "收盘价": "a50_close", "close": "a50_close",
             "开盘价": "a50_open", "open": "a50_open",
         })
-        df["date"] = pd.to_datetime(df["date"])
+        a50_daily["date"] = pd.to_datetime(a50_daily["date"])
         keep_cols = ["date", "a50_close", "a50_open"]
-        df = df[[c for c in keep_cols if c in df.columns]]
-        df = df.sort_values("date").reset_index(drop=True)
-        return df
+        a50_daily = a50_daily[[c for c in keep_cols if c in a50_daily.columns]]
+        a50_daily = a50_daily.sort_values("date").reset_index(drop=True)
     except Exception as e:
-        print(f"  [警告] 获取A50期货数据失败: {e}")
-        return pd.DataFrame()
+        print(f"  [警告] akshare A50日线数据获取失败: {e}")
+
+    # 经验检测 open 含义
+    if not a50_daily.empty and "a50_open" in a50_daily.columns:
+        convention = _detect_open_convention(a50_daily, "a50_open", "a50_close")
+        print(f"  [检测] A50 open 价格含义: {convention}")
+        if convention == "night_session_open":
+            print("  [提示] open 为夜盘开盘价，night_ret 将接近0，尝试获取日盘开盘价 ...")
+
+    # 策略2: 用 yfinance 小时线提取真正的日盘开盘价(09:00)
+    try:
+        import yfinance as yf
+        print("  [尝试] 通过 yfinance 获取 A50 小时线数据 ...")
+        ticker = yf.Ticker("CN=F")  # FTSE China A50 Futures
+        # yfinance 小时线最多 ~730 天历史
+        hourly = ticker.history(period="max", interval="1h")
+        if not hourly.empty:
+            hourly = hourly.reset_index()
+            dt_col = "Datetime" if "Datetime" in hourly.columns else "Date"
+            hourly["date"] = pd.to_datetime(hourly[dt_col]).dt.tz_localize(None)
+            # 提取日盘开盘价: 09:00-09:59 的第一根 bar
+            day_open = hourly[hourly["date"].dt.hour == 9].copy()
+            day_open["trade_date"] = day_open["date"].dt.date
+            day_open = day_open.groupby("trade_date").first().reset_index()
+            day_open["date"] = pd.to_datetime(day_open["trade_date"])
+            day_open = day_open[["date", "Open"]].rename(columns={"Open": "a50_day_open"})
+
+            # 合并到日线数据，用 a50_day_open 替换 a50_open
+            if not a50_daily.empty:
+                merged = pd.merge(a50_daily, day_open, on="date", how="left")
+                has_day_open = merged["a50_day_open"].notna().sum()
+                print(f"  [yfinance] 获取到 {has_day_open} 天的日盘真实开盘价")
+                # 有日盘开盘价的行用真实值替换
+                mask = merged["a50_day_open"].notna()
+                merged.loc[mask, "a50_open"] = merged.loc[mask, "a50_day_open"]
+                merged = merged.drop(columns=["a50_day_open"])
+                return merged
+            else:
+                # 没有日线数据，仅用 yfinance
+                daily_from_hourly = hourly.groupby(
+                    hourly["date"].dt.date
+                ).agg({"Open": "first", "Close": "last"}).reset_index()
+                daily_from_hourly.columns = ["date", "a50_open", "a50_close"]
+                daily_from_hourly["date"] = pd.to_datetime(daily_from_hourly["date"])
+                return daily_from_hourly.sort_values("date").reset_index(drop=True)
+    except ImportError:
+        print("  [提示] yfinance 未安装，跳过小时线数据获取")
+    except Exception as e:
+        print(f"  [警告] yfinance A50数据获取失败: {e}")
+
+    if not a50_daily.empty:
+        return a50_daily
+
+    print(f"  [警告] 获取A50期货数据失败")
+    return pd.DataFrame()
 
 
 def fetch_commodity_futures(symbol: str, name: str) -> pd.DataFrame:
@@ -347,11 +444,11 @@ def fetch_all_data(start_date: str = "20180101") -> dict:
         time.sleep(0.5)
     data["overseas"] = overseas_dfs
 
-    # 3. 港股期货
-    print("[3/10] 获取港股期货数据 ...")
+    # 3. 港股现货指数（非期货，open = 早盘开盘 09:15，无歧义）
+    print("[3/10] 获取港股现货指数数据 ...")
     hk_dfs = []
-    for name, symbol in HK_FUTURES.items():
-        df = fetch_hk_futures_daily(symbol, name)
+    for name, symbol in HK_INDICES.items():
+        df = fetch_hk_index_daily(symbol, name)
         if not df.empty:
             hk_dfs.append(df)
         time.sleep(0.5)

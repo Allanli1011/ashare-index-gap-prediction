@@ -5,3 +5,4 @@ scikit-learn>=1.3.0
 lightgbm>=4.0.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
+yfinance>=0.2.0  # optional: A50期货小时线数据，获取真实日盘开盘价
