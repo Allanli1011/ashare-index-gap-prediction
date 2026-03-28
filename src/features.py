@@ -100,41 +100,84 @@ def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _compute_night_session_return(odf: pd.DataFrame, prefix: str) -> pd.DataFrame:
-    """从日线 open/close 反推夜盘涨跌幅。
+def _merge_futures_with_night_session(
+    df: pd.DataFrame,
+    odf: pd.DataFrame,
+    prefix: str,
+) -> pd.DataFrame:
+    """合并期货数据，分开处理日盘和夜盘特征以确保正确的时间对齐。
 
-    原理：
-    - 期货日线 close[d] = 日盘 T session 收盘价（如A50 16:30、恒指 16:00）
-    - 期货日线 open[d+1] = 次日 T session 开盘价（如A50 09:00、恒指 09:30）
-    - 由于 T session 开盘价 ≈ 前夜 T+1 session 收盘价（间隔极短），
-      因此 open[d+1] / close[d] - 1 ≈ 夜盘涨跌幅
+    核心问题：
+    期货数据源的日线 open 价格含义不确定：
+    - 情况A: open = 日盘开盘价（如 A50 09:00，恒指 09:15）
+    - 情况B: open = 夜盘开盘价（前一天傍晚，如 A50 17:00，恒指 17:15）
 
-    时间线示例（A50期货，北京时间）：
-    d日 16:30  T session 收盘 → close[d]
-    d日 17:00  T+1 session 开盘（夜盘开始）
-    d+1日 04:45  T+1 session 收盘（夜盘结束）
-    d+1日 09:00  新的 T session 开盘 → open[d+1] ≈ 夜盘收盘价
-    d+1日 09:30  ★ A股开盘 ← 此时 open[d+1] 已知
+    如果是情况B，之前的公式 open[d+1]/close[d]-1 只是日盘收盘到夜盘开盘的
+    30分钟~1小时价差（≈0%），完全无法衡量隔夜涨跌幅。
 
-    所以对于 A股 d+1 日的预测：
-    - 日盘涨跌: close[d] / close[d-1] - 1  （已有）
-    - 夜盘涨跌: open[d+1] / close[d] - 1   （新增，最有价值的信号！）
+    修正方案 — 分离两次 merge：
+    1. close-based features（close, ret, day_ret）: shift+1
+       日盘收盘(16:00-16:30) 晚于 A股收盘(15:00) → 用于次日预测
+    2. open price: 不 shift，直接用当日数据
+       - 情况A: 日盘开盘(09:00/09:15) 早于 A股开盘(09:30) → 当天可用 ✓
+       - 情况B: 前晚夜盘开盘价 → 更早已知 → 也可用 ✓
+    3. night_ret = 当日 open / 前日 close：在 merge 后计算
+       - 情况A: 反映了完整隔夜涨跌（最有价值的信号）
+       - 情况B: ≈ 0%（不提供信息，但模型会自动忽略）
+
+    时间线（以 A50 为例，情况A）：
+    T-1日 16:30  A50 日盘收盘 → close[T-1]  ─┐
+    T-1日 17:00  A50 夜盘开盘                   │ 夜盘涨跌幅
+    T日   04:45  A50 夜盘收盘                   │ ≈ open[T] / close[T-1] - 1
+    T日   09:00  A50 日盘开盘 → open[T]     ─┘
+    T日   09:30  ★ A股开盘 ← 此时 open[T] 和 close[T-1] 都已知
     """
+    if odf is None or odf.empty:
+        return df
+
     odf = odf.copy()
     close_col = f"{prefix}_close"
     open_col = f"{prefix}_open"
 
-    if close_col not in odf.columns or open_col not in odf.columns:
-        return odf
+    # --- Part 1: close-based features, shift+1 ---
+    if close_col in odf.columns:
+        close_feats = odf[["date", close_col]].copy()
+        close_feats[f"{prefix}_ret"] = close_feats[close_col].pct_change() * 100
+        if open_col in odf.columns:
+            close_feats[f"{prefix}_day_ret"] = (
+                odf[close_col].values / odf[open_col].values - 1
+            ) * 100
+        close_feats["date"] = close_feats["date"] + pd.Timedelta(days=1)
+        df = pd.merge_asof(
+            df.sort_values("date"),
+            close_feats.sort_values("date"),
+            on="date",
+            direction="backward",
+        )
 
-    # 夜盘涨跌幅 = 次日开盘 / 当日收盘 - 1
-    # open[d+1] / close[d] → 赋值给 d+1 行（因为 d+1 开盘时已知）
-    odf[f"{prefix}_night_ret"] = (odf[open_col] / odf[close_col].shift(1) - 1) * 100
+    # --- Part 2: open price, NO shift ---
+    # 当日的 open 价格（无论是日盘开盘还是前晚夜盘开盘）在 A股 09:30 前已知
+    if open_col in odf.columns:
+        open_feats = odf[["date", open_col]].copy()
+        open_feats = open_feats.rename(columns={open_col: f"{prefix}_open_today"})
+        df = pd.merge_asof(
+            df.sort_values("date"),
+            open_feats.sort_values("date"),
+            on="date",
+            direction="backward",
+        )
 
-    # 也计算日盘涨跌幅作为参考
-    odf[f"{prefix}_day_ret"] = (odf[close_col] / odf[open_col] - 1) * 100
+        # --- Part 3: night_ret = 当日 open / 前日 close ---
+        # close 来自 shift+1 后的数据 = 前一交易日收盘价
+        # open_today 来自未 shift 的数据 = 当日开盘价
+        # 两者相除即为隔夜涨跌幅
+        if close_col in df.columns and f"{prefix}_open_today" in df.columns:
+            df[f"{prefix}_night_ret"] = (
+                df[f"{prefix}_open_today"] / df[close_col] - 1
+            ) * 100
+        df = df.drop(columns=[f"{prefix}_open_today"], errors="ignore")
 
-    return odf
+    return df
 
 
 def _merge_overnight_df(df: pd.DataFrame, odf: pd.DataFrame, shift_days: int = 1) -> pd.DataFrame:
@@ -193,23 +236,23 @@ def add_overnight_features(
     - 欧洲指数:        收盘于北京时间 d+1 凌晨 ~00:30-01:00 ✓
     - 离岸人民币CNH:   24小时交易，日结算以美国时间为准 ✓
 
-    【港股/A50 夜盘数据恢复】
-    虽然 akshare 日线只包含日盘收盘价，但可以从 open/close 反推夜盘涨跌：
-    - 夜盘涨跌幅 ≈ open[d+1] / close[d] - 1
-    - 因为次日 T session 开盘价 ≈ 前夜 T+1 session 收盘价（两个时段间隔极短）
-    - 这对 A50期货尤其重要：夜盘(17:00-04:45)跨越了整个美股交易时段
+    【港股/A50 期货的夜盘数据 — 关键修正】
+    问题：akshare 日线的 open 价格含义不确定
+    - 情况A: open = 日盘开盘价（A50 09:00, 恒指 09:15）
+    - 情况B: open = 夜盘开盘价（A50 前日17:00, 恒指 前日17:15）
 
-    时间线：
-    d日 16:30  A50 日盘收盘 → close[d]
-    d日 17:00  A50 夜盘开盘
-    d+1日 04:45  A50 夜盘收盘 ← 我们要的信息
-    d+1日 09:00  A50 日盘开盘 → open[d+1] ≈ 夜盘收盘价
-    d+1日 09:30  ★ A股开盘 ← open[d+1] 此时已知
+    如果是情况B，简单的 shift+1 会导致两个问题：
+    1. night_ret = open/close.shift(1) ≈ 0%（只是30分钟价差），无法捕捉隔夜涨跌
+    2. 即使是情况A，整体 shift+1 也会让 night_ret 延迟一天
 
-    对于 A股 d+1 的预测：
-    - open[d+1] / close[d] - 1 = A50 夜盘涨跌幅 → 这行数据本身就在 d+1 行
-    - 所以 night_ret 不需要额外 shift，它天然对齐到了 d+1 日
-    - 但 close/day_ret 还是需要 shift+1（日盘 d 的信息 → 用于 A股 d+1）
+    修正方案（_merge_futures_with_night_session）：
+    - close-based features (close, ret, day_ret): shift+1（日盘收盘晚于A股 → 次日用）
+    - open price: 不 shift（当日开盘在A股09:30前已知 → 当天可用）
+    - night_ret = 当日open / 前日close（merge后计算，避免shift错位）
+
+    结果：
+    - 情况A: night_ret 正确反映完整隔夜涨跌 ✓
+    - 情况B: night_ret ≈ 0，模型自动忽略，不引入错误信息 ✓
     """
     df = df.copy()
 
@@ -226,41 +269,36 @@ def add_overnight_features(
         for odf in china_etf_dfs:
             df = _merge_overnight_df(df, odf, shift_days=1)
 
-    # === 港股期货（含夜盘涨跌幅反推） ===
+    # === 港股期货（分离日盘/夜盘特征，修正时间对齐） ===
+    # 港股期货: 日盘 09:15-16:15, 夜盘 17:15-03:00 (北京时间)
+    # open 可能是日盘开盘(09:15)也可能是夜盘开盘(前晚17:15)
+    # 使用 _merge_futures_with_night_session 分离处理
     if hk_dfs:
         for odf in hk_dfs:
-            # 识别 prefix
             close_cols = [c for c in odf.columns if c.endswith("_close")]
             if close_cols:
                 prefix = close_cols[0].replace("_close", "")
-                odf = _compute_night_session_return(odf, prefix)
-            df = _merge_overnight_df(df, odf, shift_days=1)
+                df = _merge_futures_with_night_session(df, odf, prefix)
+            else:
+                df = _merge_overnight_df(df, odf, shift_days=1)
 
-    # === 富时A50期货（含夜盘涨跌幅反推 — 最有价值的隔夜信号） ===
+    # === 富时A50期货（分离日盘/夜盘特征 — 最有价值的隔夜信号） ===
+    # A50: 日盘 09:00-16:30, 夜盘 17:00-04:45 (北京时间)
+    # 夜盘跨越整个美股交易时段，是A股次日开盘最重要的参考
     if a50_df is not None and not a50_df.empty:
-        a50 = a50_df.copy()
-        a50 = _compute_night_session_return(a50, "a50")
-        a50["a50_ret"] = a50["a50_close"].pct_change() * 100
+        df = _merge_futures_with_night_session(df, a50_df, "a50")
 
-        # 分离夜盘特征（不需要额外shift）和日盘特征（需要shift+1）
-        # night_ret[d+1] = open[d+1]/close[d] - 1，对于A股 d+1 日预测已对齐
-        # 但经过 shift+1 后，A股 d+1 会匹配到 d+1 的数据 → night_ret 正确
-        a50["date"] = a50["date"] + pd.Timedelta(days=1)
-        df = pd.merge_asof(
-            df.sort_values("date"),
-            a50.sort_values("date"),
-            on="date",
-            direction="backward",
-        )
-
-    # === 境外商品期货（含夜盘涨跌幅反推） ===
+    # === 境外商品期货 ===
+    # 商品期货(WTI/布伦特/铜)在CME/ICE以近24小时电子盘交易，
+    # open/close的"夜盘"含义不如A50/恒指清晰，但分离处理仍更安全
     if commodity_dfs:
         for odf in commodity_dfs:
             close_cols = [c for c in odf.columns if c.endswith("_close")]
             if close_cols:
                 prefix = close_cols[0].replace("_close", "")
-                odf = _compute_night_session_return(odf, prefix)
-            df = _merge_overnight_df(df, odf, shift_days=1)
+                df = _merge_futures_with_night_session(df, odf, prefix)
+            else:
+                df = _merge_overnight_df(df, odf, shift_days=1)
 
     # === 欧洲指数（收盘于北京时间 d+1 ~00:30-01:00） ===
     if euro_dfs:
