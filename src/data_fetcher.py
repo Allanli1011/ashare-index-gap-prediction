@@ -1,11 +1,13 @@
 """
 数据获取模块：通过 akshare 获取A股指数数据和隔夜因子数据。
 """
+from __future__ import annotations
 import json
 import time
 import urllib.request
 
 import pandas as pd
+import numpy as np
 import akshare as ak
 
 # A股主要指数代码映射
@@ -136,8 +138,24 @@ def fetch_usd_cny() -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _fetch_hk_index_spot(symbol: str) -> float | None:
+    """从港股实时行情获取今日开盘价。"""
+    try:
+        df = ak.stock_hk_index_spot_sina()
+        # 匹配代码或名称
+        mask = (df["代码"] == symbol) | (df["名称"].str.contains(symbol))
+        target = df[mask]
+        if not target.empty:
+            open_val = float(target.iloc[0]["今开"])
+            if open_val > 0:
+                return open_val
+    except Exception as e:
+        print(f"  [警告] 获取港股实时快照失败: {e}")
+    return None
+
+
 def fetch_hk_index_daily(symbol: str, name: str) -> pd.DataFrame:
-    """获取港股现货指数日线数据。
+    """获取港股现货指数日线数据（含今日实时开盘价回填）。
 
     注意：akshare stock_hk_index_daily_sina 返回的是现货指数（非期货）。
     现货指数无夜盘交易，因此：
@@ -157,6 +175,21 @@ def fetch_hk_index_daily(symbol: str, name: str) -> pd.DataFrame:
         keep_cols = ["date", f"hk_{symbol}_close", f"hk_{symbol}_open"]
         df = df[[c for c in keep_cols if c in df.columns]]
         df = df.sort_values("date").reset_index(drop=True)
+
+        # ---- 实时回填逻辑 (09:20 - 15:59) ----
+        # 如果日线数据不包含今日，则尝试获取快照中的“今开”进行回填
+        today = pd.Timestamp.today().normalize()
+        if df.empty or df["date"].max() < today:
+            spot_open = _fetch_hk_index_spot(symbol if symbol != "HSI" else "恒生指数")
+            if spot_open is not None:
+                new_row = pd.DataFrame([{
+                    "date": today,
+                    f"hk_{symbol}_open": spot_open,
+                    f"hk_{symbol}_close": np.nan  # 此时收盘价未知
+                }])
+                df = pd.concat([df, new_row], ignore_index=True)
+                print(f"  [实时回填] 已获取 {name} 今日开盘价: {spot_open}")
+
         return df
     except Exception as e:
         print(f"  [警告] 获取 {name} 数据失败: {e}")
